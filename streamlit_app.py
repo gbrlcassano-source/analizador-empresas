@@ -23,7 +23,8 @@ def load(t, e):
 @st.cache_data(ttl=15 * 60, show_spinner="Bajando precios...")
 def load_market(t, q, sh):
     px, sp, snap = market_data(t, sh)
-    return snap, px, multiples(q, sh, px, sp)
+    fb = snap["cap"] / snap["price"] if len(sh) == 0 and snap["cap"] and snap["price"] else None
+    return snap, px, multiples(q, sh, px, sp, fb)
 
 
 if not email:
@@ -127,6 +128,8 @@ try:
                + ("" if snap["fwd_pe"] else " Yahoo no entregó estimaciones para este ticker."))
 
     if not mult.empty:
+        if len(sh) == 0:
+            st.caption("La SEC no informa las acciones de esta empresa: los múltiplos históricos usan las acciones actuales (aproximado).")
         opts = st.multiselect("Múltiplos históricos", ["P/E", "P/S", "P/FCF", "P/B"], ["P/E", "P/S", "P/FCF"])
         f = go.Figure([go.Scatter(x=mult.index, y=mult[o], name=o, mode="lines+markers") for o in opts])
         f.update_layout(title="Múltiplos al cierre de cada trimestre (veces)", legend_orientation="h")

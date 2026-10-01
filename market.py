@@ -34,15 +34,22 @@ def market_data(ticker, shares):
     return px, sp, {"price": price, "cap": cap, "fwd_pe": fwd, "pe": info.get("trailingPE"), "debt": info.get("totalDebt"), "cash": info.get("totalCash")}
 
 
-def multiples(q, shares, px, splits):
-    """Múltiplos al cierre de cada trimestre: precio x acciones / métricas de 12 meses."""
+def multiples(q, shares, px, splits, fallback=None):
+    """Múltiplos al cierre de cada período: precio x acciones / métricas de 12 meses.
+    Si la SEC no informa acciones, usa `fallback` (acciones actuales, aproximado)."""
     rows = {}
     for end, r in q.iterrows():
-        nxt = shares[(shares.index >= end) & (shares.index <= end + pd.Timedelta(days=90))]
         p = px[:end]
-        if nxt.empty or p.empty:
+        if p.empty:
             continue
-        cap = p.iloc[-1] * nxt.iloc[0] * splits[splits.index > end].prod()  # lleva acciones a base actual
+        nxt = shares[(shares.index >= end) & (shares.index <= end + pd.Timedelta(days=90))] if len(shares) else shares
+        if len(nxt):
+            sh = nxt.iloc[0] * splits[splits.index > end].prod()  # lleva acciones a base actual
+        elif fallback and not len(shares):
+            sh = fallback
+        else:
+            continue
+        cap = p.iloc[-1] * sh
         pos = lambda v: cap / v if pd.notna(v) and v > 0 else None
         rows[end] = {"P/E": pos(r["ttm_net_income"]), "P/S": pos(r["ttm_revenue"]),
                      "P/FCF": pos(r["ttm_fcf"]), "P/B": pos(r["equity"])}

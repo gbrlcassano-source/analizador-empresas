@@ -127,7 +127,7 @@ def shares_outstanding(facts):
     """Acciones en circulación según la tapada de cada reporte (suma las clases de acciones)."""
     rows = facts.get("facts", {}).get("dei", {}).get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
     if not rows:
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
     s = pd.DataFrame(rows).drop_duplicates(["end", "val"]).groupby("end")["val"].sum().astype(float)
     s.index = pd.to_datetime(s.index)
     return s.sort_index()
