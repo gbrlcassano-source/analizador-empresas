@@ -2,23 +2,26 @@
 import requests
 import pandas as pd
 
-CONCEPTS = {
-    "revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"],
+CONCEPTS = {  # primero nombres US-GAAP, después IFRS (empresas extranjeras con 20-F)
+    "revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "Revenue"],
     "gross_profit": ["GrossProfit"],
-    "op_income": ["OperatingIncomeLoss"],
-    "net_income": ["NetIncomeLoss"],
-    "cfo": ["NetCashProvidedByUsedInOperatingActivities"],
-    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"],
-    "buybacks": ["PaymentsForRepurchaseOfCommonStock"],
-    "dividends": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
+    "op_income": ["OperatingIncomeLoss", "ProfitLossFromOperatingActivities"],
+    "pretax": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "ProfitLossBeforeTax"],
+    "net_income": ["NetIncomeLoss", "ProfitLossAttributableToOwnersOfParent", "ProfitLoss"],
+    "cfo": ["NetCashProvidedByUsedInOperatingActivities", "CashFlowsFromUsedInOperatingActivities"],
+    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets", "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities"],
+    "buybacks": ["PaymentsForRepurchaseOfCommonStock", "PaymentsToAcquireOrRedeemEntitysShares"],
+    "dividends": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock", "DividendsPaidClassifiedAsFinancingActivities"],
     "assets": ["Assets"],
-    "equity": ["StockholdersEquity"],
-    "cash": ["CashAndCashEquivalentsAtCarryingValue"],
+    "equity": ["StockholdersEquity", "EquityAttributableToOwnersOfParent", "Equity"],
+    "cash": ["CashAndCashEquivalentsAtCarryingValue", "CashAndCashEquivalents"],
     "securities": ["MarketableSecuritiesCurrent"],
     "debt": ["LongTermDebtNoncurrent", "LongTermDebt"],
     "debt_st": ["LongTermDebtCurrent", "ShortTermBorrowings"],
+    "loans": ["LoansAndLeasesReceivableNetReportedAmount", "LoansAndAdvancesToCustomers"],
+    "deposits": ["Deposits", "DepositsFromCustomers"],
 }
-FLOWS = {"revenue", "gross_profit", "op_income", "net_income", "cfo", "capex", "buybacks", "dividends"}
+FLOWS = {"revenue", "gross_profit", "op_income", "pretax", "net_income", "cfo", "capex", "buybacks", "dividends"}
 
 
 def _get(url, email):
@@ -37,14 +40,19 @@ def get_facts(ticker, email):
     return m["title"], _get(url, email)
 
 
+FORMS = ["10-K", "10-K/A", "10-Q", "20-F", "20-F/A"]
+ANNUAL_FORMS = ["10-K", "10-K/A", "20-F", "20-F/A"]
+
+
 def _frames(facts, names):
-    gaap = facts.get("facts", {}).get("us-gaap", {})
     out = []
-    for n in names:
-        rows = gaap.get(n, {}).get("units", {}).get("USD")
-        if rows:
-            df = pd.DataFrame(rows)
-            out.append(df[df["form"].isin(["10-K", "10-K/A", "10-Q"])])
+    for tax in ("us-gaap", "ifrs-full"):
+        items = facts.get("facts", {}).get(tax, {})
+        for n in names:
+            rows = items.get(n, {}).get("units", {}).get("USD")
+            if rows:
+                df = pd.DataFrame(rows)
+                out.append(df[df["form"].isin(FORMS)])
     return out
 
 
@@ -63,7 +71,7 @@ def _flow(facts, names, annual):
         df = df[df["start"].notna()].sort_values("filed").drop_duplicates(["start", "end"], keep="last")
         df = df.assign(days=(pd.to_datetime(df["end"]) - pd.to_datetime(df["start"])).dt.days)
         if annual:
-            y = df[(df["form"] != "10-Q") & df["days"].between(350, 380)]
+            y = df[df["form"].isin(ANNUAL_FORMS) & df["days"].between(350, 380)]
             s = y.set_index("end")["val"].astype(float)
         else:
             parts = []
@@ -92,6 +100,7 @@ def _metrics(d, k):
     d["op_margin"] = d["op_income"] / d["revenue"]
     d["net_margin"] = d["net_income"] / d["revenue"]
     d["fcf_margin"] = d["fcf"] / d["revenue"]
+    d["pretax_margin"] = d["pretax"] / d["revenue"]
     for name, col in [("roe", "equity"), ("roa", "assets")]:
         avg = ((d[col] + d[col].shift(k)) / 2).fillna(d[col])
         d[name] = d["ttm_net_income"] / avg
@@ -100,7 +109,8 @@ def _metrics(d, k):
 
 def _table(facts, annual):
     d = pd.DataFrame({k: (_flow(facts, v, annual) if k in FLOWS else _instant(facts, v)) for k, v in CONCEPTS.items()})
-    d = d[d["revenue"].notna()].sort_index()
+    key = "revenue" if d["revenue"].notna().any() else "net_income"  # IFRS: el nombre de ingresos puede variar
+    d = d[d[key].notna()].sort_index()
     d.index = pd.to_datetime(d.index)
     return _metrics(d, 1 if annual else 4)
 
@@ -114,9 +124,22 @@ def quarterly_table(facts):
 
 
 def shares_outstanding(facts):
-    """Acciones en circulación según la tapada de cada reporte (fecha de tapada)."""
+    """Acciones en circulación según la tapada de cada reporte (suma las clases de acciones)."""
     rows = facts.get("facts", {}).get("dei", {}).get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
     if not rows:
         return pd.Series(dtype=float)
-    df = pd.DataFrame(rows).sort_values("filed").drop_duplicates("end", keep="last")
-    return df.set_index(pd.to_datetime(df["end"]))["val"].astype(float).sort_index()
+    s = pd.DataFrame(rows).drop_duplicates(["end", "val"]).groupby("end")["val"].sum().astype(float)
+    s.index = pd.to_datetime(s.index)
+    return s.sort_index()
+
+
+def concept_catalog(facts):
+    """Lista de conceptos con datos anuales en USD: sirve para ubicar cifras que la herramienta no encuentra."""
+    rows = []
+    for tax, items in facts.get("facts", {}).items():
+        for name, c in items.items():
+            v = [x for x in c.get("units", {}).get("USD", []) if x["form"] in ANNUAL_FORMS]
+            if v:
+                last = max(v, key=lambda x: (x["end"], x["filed"]))
+                rows.append({"taxonomía": tax, "concepto": name, "último cierre": last["end"], "valor (US$ M)": round(last["val"] / 1e6, 1)})
+    return pd.DataFrame(rows, columns=["taxonomía", "concepto", "último cierre", "valor (US$ M)"])

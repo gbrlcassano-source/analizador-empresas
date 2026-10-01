@@ -4,7 +4,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from market import market_data, multiples
-from sec import annual_table, get_facts, quarterly_table, shares_outstanding
+from sec import annual_table, concept_catalog, get_facts, quarterly_table, shares_outstanding
 
 st.set_page_config(page_title="Analizador de empresas", layout="wide")
 st.title("Analizador de empresas")
@@ -17,7 +17,7 @@ n = st.sidebar.slider("Períodos a mostrar", 4, 40, 12)
 @st.cache_data(ttl=6 * 3600, show_spinner="Bajando datos de la SEC...")
 def load(t, e):
     name, facts = get_facts(t, e)
-    return name, annual_table(facts), quarterly_table(facts), shares_outstanding(facts)
+    return name, annual_table(facts), quarterly_table(facts), shares_outstanding(facts), concept_catalog(facts)
 
 
 @st.cache_data(ttl=15 * 60, show_spinner="Bajando precios...")
@@ -30,10 +30,39 @@ if not email:
     st.info("Ingresá tu email en la barra lateral para empezar.")
     st.stop()
 try:
-    name, a, q, sh = load(ticker, email)
+    name, a, q, sh, cat = load(ticker, email)
 except Exception as ex:
     st.error(str(ex))
     st.stop()
+
+def explorer():
+    with st.expander("Explorar datos disponibles en la SEC"):
+        flt = st.text_input("Filtrar por nombre (ej: loan, deposit, revenue)")
+        st.dataframe(cat[cat["concepto"].str.contains(flt, case=False)] if flt else cat, height=300)
+
+
+if a.empty:
+    st.warning(f"No encontré estados financieros de {name} ({ticker.upper()}) en formato que esta herramienta entienda. Muestro solo datos de mercado de Yahoo Finance.")
+    try:
+        snap, px, _ = load_market(ticker, q, sh)
+        m = st.columns(4)
+        m[0].metric("Precio", f"{snap['price']:,.2f}" if snap["price"] else "n/d")
+        m[1].metric("Capitalización", f"US${snap['cap'] / 1e9:,.1f} mil M" if snap["cap"] else "n/d")
+        m[2].metric("P/E (12M)", f"{snap['pe']:.1f}x" if snap["pe"] else "n/d")
+        m[3].metric("P/E forward", f"{snap['fwd_pe']:.1f}x" if snap["fwd_pe"] else "n/d")
+        f = go.Figure(go.Scatter(x=px.index, y=px.values, mode="lines"))
+        f.update_layout(title="Precio (US$)")
+        st.plotly_chart(f, use_container_width=True)
+    except Exception as ex:
+        st.warning(f"No pude traer precios de Yahoo Finance ({ex}).")
+    explorer()
+    st.stop()
+
+only_annual = q.empty
+per = "año fiscal" if only_annual else "12M"
+if only_annual:
+    st.info("Esta empresa presenta 20-F (extranjera, normas IFRS): la SEC solo ofrece datos anuales, sin trimestres. Los resultados trimestrales están en los comunicados de la propia empresa. En bancos, el FCF no es una métrica relevante.")
+    freq, q = "Anual", a
 
 d = (a if freq == "Anual" else q).tail(n)
 x = d.index.year.astype(str) if freq == "Anual" else d.index.strftime("%Y-%m")
@@ -44,6 +73,8 @@ def bars(cols, names, title):
     """Barras agrupadas; al pasar el cursor muestra también la variación interanual."""
     f = go.Figure()
     for c, nm in zip(cols, names):
+        if d[c].isna().all():
+            continue
         tip, tpl = None, None
         if c + "_yoy" in d:
             tip = [f"{v:+.1f}%" if pd.notna(v) else "n/d" for v in d[c + "_yoy"] * 100]
@@ -54,7 +85,7 @@ def bars(cols, names, title):
 
 
 def lines(cols, names, title):
-    f = go.Figure([go.Scatter(x=x, y=d[c] * 100, name=nm, mode="lines+markers") for c, nm in zip(cols, names)])
+    f = go.Figure([go.Scatter(x=x, y=d[c] * 100, name=nm, mode="lines+markers") for c, nm in zip(cols, names) if d[c].notna().any()])
     f.update_layout(title=title + " (%)", legend_orientation="h")
     return f
 
@@ -65,10 +96,12 @@ def show(col, fig):
 
 c1, c2 = st.columns(2)
 show(c1, bars(["revenue", "op_income", "net_income", "fcf"], ["Ingresos", "Res. operativo", "Utilidad neta", "FCF"], "Ingresos, resultados y FCF"))
-show(c2, lines(["gross_margin", "op_margin", "net_margin", "fcf_margin"], ["Bruto", "Operativo", "Neto", "FCF"], "Márgenes"))
+show(c2, lines(["gross_margin", "op_margin", "pretax_margin", "net_margin", "fcf_margin"], ["Bruto", "Operativo", "Antes de impuestos", "Neto", "FCF"], "Márgenes"))
 c3, c4 = st.columns(2)
 show(c3, lines(["roe", "roa"], ["ROE", "ROA"], "ROE y ROA (utilidad 12M / promedio)"))
 show(c4, bars(["buybacks", "dividends"], ["Recompras", "Dividendos"], "Retorno al accionista"))
+if d[["loans", "deposits"]].notna().any().any():
+    show(st.columns(2)[0], bars(["loans", "deposits", "equity"], ["Préstamos", "Depósitos", "Patrimonio"], "Balance bancario"))
 
 st.subheader("Valuación y precio")
 try:
@@ -85,12 +118,12 @@ try:
     m = st.columns(7)
     m[0].metric("Precio", f"{price:,.2f}" if price else "n/d")
     m[1].metric("Capitalización", f"US${cap / 1e9:,.0f} mil M" if cap else "n/d")
-    m[2].metric("P/E (12M)", ratio(cap, lq["ttm_net_income"]))
+    m[2].metric(f"P/E ({per})", ratio(cap, lq["ttm_net_income"]))
     m[3].metric("P/E forward", f"{snap['fwd_pe']:.1f}x" if snap["fwd_pe"] else "n/d")
     m[4].metric("EV/Ventas", ratio(ev, lq["ttm_revenue"]))
     m[5].metric("EV/EBIT", ratio(ev, lq["ttm_op_income"]))
     m[6].metric("Rend. FCF", f"{lq['ttm_fcf'] / cap:.1%}" if cap and pd.notna(lq["ttm_fcf"]) else "n/d")
-    st.caption("Múltiplos con los últimos 12 meses reportados. P/E forward: estimaciones de analistas según Yahoo (solo dato actual, sin historia gratuita)."
+    st.caption(f"Múltiplos con {'el último año fiscal' if only_annual else 'los últimos 12 meses'} reportado. P/E forward: estimaciones de analistas según Yahoo (solo dato actual, sin historia gratuita)."
                + ("" if snap["fwd_pe"] else " Yahoo no entregó estimaciones para este ticker."))
 
     if not mult.empty:
@@ -116,6 +149,7 @@ try:
 except Exception as ex:
     st.warning(f"No pude traer precios de Yahoo Finance ({ex}). El resto del análisis sigue funcionando.")
 
+explorer()
 with st.expander("Ver tabla de datos"):
     st.dataframe(d)
     st.download_button("Descargar CSV", d.to_csv(), f"{ticker.upper()}_{freq.lower()}.csv")

@@ -31,14 +31,14 @@ def market_data(ticker, shares):
     if not fwd and price:
         eps = info.get("forwardEps") or _try(lambda: float(t.earnings_estimate.loc["+1y", "avg"]))
         fwd = price / eps if eps and eps > 0 else None
-    return px, sp, {"price": price, "cap": cap, "fwd_pe": fwd, "debt": info.get("totalDebt"), "cash": info.get("totalCash")}
+    return px, sp, {"price": price, "cap": cap, "fwd_pe": fwd, "pe": info.get("trailingPE"), "debt": info.get("totalDebt"), "cash": info.get("totalCash")}
 
 
 def multiples(q, shares, px, splits):
     """Múltiplos al cierre de cada trimestre: precio x acciones / métricas de 12 meses."""
     rows = {}
     for end, r in q.iterrows():
-        nxt = shares[(shares.index > end) & (shares.index <= end + pd.Timedelta(days=90))]
+        nxt = shares[(shares.index >= end) & (shares.index <= end + pd.Timedelta(days=90))]
         p = px[:end]
         if nxt.empty or p.empty:
             continue
