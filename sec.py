@@ -1,4 +1,4 @@
-"""Datos de la SEC (EDGAR) -> tabla anual de métricas. Solo empresas de EE.UU."""
+"""Datos de la SEC (EDGAR) -> tablas anual y trimestral. Solo empresas de EE.UU."""
 import requests
 import pandas as pd
 
@@ -33,37 +33,85 @@ def get_facts(ticker, email):
     return m["title"], _get(url, email)
 
 
-def _series(facts, names, flow):
+def _frames(facts, names):
     gaap = facts.get("facts", {}).get("us-gaap", {})
-    out = pd.Series(dtype=float)
-    for n in names:  # los primeros nombres tienen prioridad; los demás rellenan huecos
+    out = []
+    for n in names:
         rows = gaap.get(n, {}).get("units", {}).get("USD")
-        if not rows:
-            continue
-        df = pd.DataFrame(rows)
-        df = df[df["form"].isin(["10-K", "10-K/A"])]
-        if flow:
-            df = df[df["start"].notna()]
-            days = (pd.to_datetime(df["end"]) - pd.to_datetime(df["start"])).dt.days
-            df = df[days.between(350, 380)]  # solo períodos anuales
-        if df.empty:
-            continue
+        if rows:
+            df = pd.DataFrame(rows)
+            out.append(df[df["form"].isin(["10-K", "10-K/A", "10-Q"])])
+    return out
+
+
+def _instant(facts, names):
+    out = pd.Series(dtype=float)
+    for df in _frames(facts, names):
         df = df.sort_values("filed").drop_duplicates("end", keep="last")
         out = out.combine_first(df.set_index("end")["val"].astype(float))
     return out
 
 
-def annual_table(facts):
-    d = pd.DataFrame({k: _series(facts, v, k in FLOWS) for k, v in CONCEPTS.items()})
-    d = d[d["revenue"].notna()].sort_index()
-    d.index = pd.to_datetime(d.index)
+def _flow(facts, names, annual):
+    """Flujos anuales, o trimestrales (los 10-Q traen acumulado del año: se diferencia)."""
+    out = pd.Series(dtype=float)
+    for df in _frames(facts, names):
+        df = df[df["start"].notna()].sort_values("filed").drop_duplicates(["start", "end"], keep="last")
+        df = df.assign(days=(pd.to_datetime(df["end"]) - pd.to_datetime(df["start"])).dt.days)
+        if annual:
+            y = df[(df["form"] != "10-Q") & df["days"].between(350, 380)]
+            s = y.set_index("end")["val"].astype(float)
+        else:
+            parts = []
+            for start, g in df[df["days"] <= 380].groupby("start"):
+                v = g.sort_values("end").set_index("end")["val"].astype(float)
+                ends = pd.DatetimeIndex(pd.to_datetime(v.index))
+                prev = pd.DatetimeIndex([pd.to_datetime(start)] + list(ends[:-1]))
+                span = (ends - prev).days
+                q = v.diff().fillna(v)
+                q[(span < 60) | (span > 130)] = float("nan")  # faltó un período: no inventar
+                parts.append(q)
+            s = pd.concat(parts) if parts else pd.Series(dtype=float)
+            s = s[~s.index.duplicated()].dropna()
+        out = out.combine_first(s)
+    return out
+
+
+def _metrics(d, k):
+    """k = períodos por año (1 anual, 4 trimestral)."""
     d["fcf"] = d["cfo"] - d["capex"]
-    d["rev_growth"] = d["revenue"].pct_change()
+    for c in ["revenue", "gross_profit", "op_income", "net_income", "fcf"]:
+        d[c + "_yoy"] = d[c].pct_change(k, fill_method=None)
+        d["ttm_" + c] = d[c].rolling(k).sum() if k > 1 else d[c]
     d["gross_margin"] = d["gross_profit"] / d["revenue"]
     d["op_margin"] = d["op_income"] / d["revenue"]
     d["net_margin"] = d["net_income"] / d["revenue"]
     d["fcf_margin"] = d["fcf"] / d["revenue"]
     for name, col in [("roe", "equity"), ("roa", "assets")]:
-        avg = ((d[col] + d[col].shift()) / 2).fillna(d[col])  # promedio; el 1er año usa el cierre
-        d[name] = d["net_income"] / avg
+        avg = ((d[col] + d[col].shift(k)) / 2).fillna(d[col])
+        d[name] = d["ttm_net_income"] / avg
     return d
+
+
+def _table(facts, annual):
+    d = pd.DataFrame({k: (_flow(facts, v, annual) if k in FLOWS else _instant(facts, v)) for k, v in CONCEPTS.items()})
+    d = d[d["revenue"].notna()].sort_index()
+    d.index = pd.to_datetime(d.index)
+    return _metrics(d, 1 if annual else 4)
+
+
+def annual_table(facts):
+    return _table(facts, True)
+
+
+def quarterly_table(facts):
+    return _table(facts, False)
+
+
+def shares_outstanding(facts):
+    """Acciones en circulación según la tapada de cada reporte (fecha de tapada)."""
+    rows = facts.get("facts", {}).get("dei", {}).get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
+    if not rows:
+        return pd.Series(dtype=float)
+    df = pd.DataFrame(rows).sort_values("filed").drop_duplicates("end", keep="last")
+    return df.set_index(pd.to_datetime(df["end"]))["val"].astype(float).sort_index()
