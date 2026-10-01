@@ -3,14 +3,35 @@ import pandas as pd
 import yfinance as yf
 
 
-def market_data(ticker):
+def _try(fn):
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+def market_data(ticker, shares):
+    """Devuelve (precios, splits, datos actuales). Cada dato tiene respaldos si Yahoo no lo entrega."""
     t = yf.Ticker(ticker.strip().upper())
-    info = t.info or {}
+    info = _try(lambda: t.info) or {}
     px = t.history(period="max", auto_adjust=False)["Close"]  # ajustado por splits, no por dividendos
     sp = t.splits
     px.index = px.index.tz_localize(None)
-    sp.index = sp.index.tz_localize(None)
-    return info, px, sp
+    if len(sp):
+        sp.index = sp.index.tz_localize(None)
+    else:
+        sp = pd.Series(dtype=float, index=pd.DatetimeIndex([]))  # sin splits
+    price = info.get("currentPrice") or info.get("regularMarketPrice") or _try(lambda: t.fast_info["last_price"])
+    if not price and len(px):
+        price = float(px.iloc[-1])
+    cap = info.get("marketCap") or _try(lambda: t.fast_info["market_cap"])
+    if not cap and price and len(shares):  # respaldo: acciones de la SEC llevadas a base actual
+        cap = price * shares.iloc[-1] * sp[sp.index > shares.index[-1]].prod()
+    fwd = info.get("forwardPE")
+    if not fwd and price:
+        eps = info.get("forwardEps") or _try(lambda: float(t.earnings_estimate.loc["+1y", "avg"]))
+        fwd = price / eps if eps and eps > 0 else None
+    return px, sp, {"price": price, "cap": cap, "fwd_pe": fwd, "debt": info.get("totalDebt"), "cash": info.get("totalCash")}
 
 
 def multiples(q, shares, px, splits):

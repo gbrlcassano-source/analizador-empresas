@@ -22,8 +22,8 @@ def load(t, e):
 
 @st.cache_data(ttl=15 * 60, show_spinner="Bajando precios...")
 def load_market(t, q, sh):
-    info, px, sp = market_data(t)
-    return info, px, multiples(q, sh, px, sp)
+    px, sp, snap = market_data(t, sh)
+    return snap, px, multiples(q, sh, px, sp)
 
 
 if not email:
@@ -40,9 +40,16 @@ x = d.index.year.astype(str) if freq == "Anual" else d.index.strftime("%Y-%m")
 st.subheader(f"{name} ({ticker.upper()}) · {freq.lower()}")
 
 
-def bars(cols, names, title, scale=1e9, unit=" (US$ mil millones)"):
-    f = go.Figure([go.Bar(x=x, y=d[c] / scale, name=nm) for c, nm in zip(cols, names)])
-    f.update_layout(title=title + unit, barmode="group", legend_orientation="h")
+def bars(cols, names, title):
+    """Barras agrupadas; al pasar el cursor muestra también la variación interanual."""
+    f = go.Figure()
+    for c, nm in zip(cols, names):
+        tip, tpl = None, None
+        if c + "_yoy" in d:
+            tip = [f"{v:+.1f}%" if pd.notna(v) else "n/d" for v in d[c + "_yoy"] * 100]
+            tpl = nm + ": %{y:,.1f}<br>Var. interanual: %{customdata}<extra></extra>"
+        f.add_trace(go.Bar(x=x, y=d[c] / 1e9, name=nm, customdata=tip, hovertemplate=tpl))
+    f.update_layout(title=title + " (US$ mil millones)", barmode="group", legend_orientation="h", hovermode="x unified")
     return f
 
 
@@ -57,22 +64,19 @@ def show(col, fig):
 
 
 c1, c2 = st.columns(2)
-show(c1, bars(["revenue", "net_income", "fcf"], ["Ingresos", "Utilidad neta", "FCF"], "Ingresos, utilidad y FCF"))
+show(c1, bars(["revenue", "op_income", "net_income", "fcf"], ["Ingresos", "Res. operativo", "Utilidad neta", "FCF"], "Ingresos, resultados y FCF"))
 show(c2, lines(["gross_margin", "op_margin", "net_margin", "fcf_margin"], ["Bruto", "Operativo", "Neto", "FCF"], "Márgenes"))
 c3, c4 = st.columns(2)
-yoy = bars(["revenue_yoy", "op_income_yoy", "net_income_yoy", "fcf_yoy"], ["Ingresos", "Res. operativo", "Utilidad neta", "FCF"], "Variación interanual", 0.01, " (%)")
-yoy.update_layout(title="Variación " + ("año contra año" if freq == "Anual" else "contra el mismo trimestre del año anterior") + " (%)")
-show(c3, yoy)
-show(c4, lines(["roe", "roa"], ["ROE", "ROA"], "ROE y ROA (utilidad 12M / promedio)"))
-show(st.columns(1)[0], bars(["buybacks", "dividends"], ["Recompras", "Dividendos"], "Retorno al accionista"))
+show(c3, lines(["roe", "roa"], ["ROE", "ROA"], "ROE y ROA (utilidad 12M / promedio)"))
+show(c4, bars(["buybacks", "dividends"], ["Recompras", "Dividendos"], "Retorno al accionista"))
 
 st.subheader("Valuación y precio")
 try:
-    info, px, mult = load_market(ticker, q, sh)
+    snap, px, mult = load_market(ticker, q, sh)
     lq = q.iloc[-1]
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
-    cap = info.get("marketCap")
-    ev = cap + (info.get("totalDebt") or 0) - (info.get("totalCash") or 0) if cap else None
+    price, cap = snap["price"], snap["cap"]
+    nd = lq["net_debt"] if pd.notna(lq["net_debt"]) else (snap["debt"] or 0) - (snap["cash"] or 0)
+    ev = cap + nd if cap else None  # deuda neta aproximada, del último balance
 
     def ratio(a_, b_):
         ok = a_ is not None and pd.notna(a_) and pd.notna(b_) and b_ > 0
@@ -82,11 +86,12 @@ try:
     m[0].metric("Precio", f"{price:,.2f}" if price else "n/d")
     m[1].metric("Capitalización", f"US${cap / 1e9:,.0f} mil M" if cap else "n/d")
     m[2].metric("P/E (12M)", ratio(cap, lq["ttm_net_income"]))
-    m[3].metric("P/E forward", f"{info['forwardPE']:.1f}x" if info.get("forwardPE") else "n/d")
+    m[3].metric("P/E forward", f"{snap['fwd_pe']:.1f}x" if snap["fwd_pe"] else "n/d")
     m[4].metric("EV/Ventas", ratio(ev, lq["ttm_revenue"]))
     m[5].metric("EV/EBIT", ratio(ev, lq["ttm_op_income"]))
     m[6].metric("Rend. FCF", f"{lq['ttm_fcf'] / cap:.1%}" if cap and pd.notna(lq["ttm_fcf"]) else "n/d")
-    st.caption("Múltiplos actuales con los últimos 12 meses reportados. El P/E forward es solo el dato actual: no hay historia gratuita de estimaciones de analistas.")
+    st.caption("Múltiplos con los últimos 12 meses reportados. P/E forward: estimaciones de analistas según Yahoo (solo dato actual, sin historia gratuita)."
+               + ("" if snap["fwd_pe"] else " Yahoo no entregó estimaciones para este ticker."))
 
     if not mult.empty:
         opts = st.multiselect("Múltiplos históricos", ["P/E", "P/S", "P/FCF", "P/B"], ["P/E", "P/S", "P/FCF"])
@@ -95,11 +100,15 @@ try:
         st.plotly_chart(f, use_container_width=True)
 
     labels = {"ttm_fcf": "FCF 12M", "ttm_revenue": "Ingresos 12M", "ttm_net_income": "Utilidad neta 12M", "ttm_op_income": "Res. operativo 12M"}
-    key = st.selectbox("Comparar la cotización con", list(labels), format_func=labels.get)
+    k1, k2 = st.columns(2)
+    key = k1.selectbox("Comparar la cotización con", list(labels), format_func=labels.get)
+    maxy = int(min(30, max(2, (px.index.max() - q.index.min()).days // 365 + 1)))
+    yrs = k2.slider("Años a mostrar", 1, maxy, min(10, maxy))
+    start = px.index.max() - pd.DateOffset(years=yrs)
+    pxs, qs = px[px.index >= start], q[q.index >= start]
     f = make_subplots(specs=[[{"secondary_y": True}]])
-    f.add_trace(go.Scatter(x=px.index, y=px.values, name="Precio (US$)", mode="lines"), secondary_y=False)
-    f.add_trace(go.Scatter(x=q.index, y=q[key] / 1e9, name=labels[key] + " (US$ mil M)", line_shape="hv"), secondary_y=True)
-    f.update_xaxes(range=[q.index.min(), px.index.max()])
+    f.add_trace(go.Scatter(x=pxs.index, y=pxs.values, name="Precio (US$)", mode="lines"), secondary_y=False)
+    f.add_trace(go.Scatter(x=qs.index, y=qs[key] / 1e9, name=labels[key] + " (US$ mil M)", line_shape="hv"), secondary_y=True)
     f.update_yaxes(title_text="Precio (US$)", secondary_y=False)
     f.update_yaxes(title_text=labels[key] + " (US$ mil M)", secondary_y=True)
     f.update_layout(title="Cotización vs " + labels[key], legend_orientation="h")

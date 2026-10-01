@@ -13,6 +13,10 @@ CONCEPTS = {
     "dividends": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
     "assets": ["Assets"],
     "equity": ["StockholdersEquity"],
+    "cash": ["CashAndCashEquivalentsAtCarryingValue"],
+    "securities": ["MarketableSecuritiesCurrent"],
+    "debt": ["LongTermDebtNoncurrent", "LongTermDebt"],
+    "debt_st": ["LongTermDebtCurrent", "ShortTermBorrowings"],
 }
 FLOWS = {"revenue", "gross_profit", "op_income", "net_income", "cfo", "capex", "buybacks", "dividends"}
 
@@ -80,6 +84,7 @@ def _flow(facts, names, annual):
 def _metrics(d, k):
     """k = períodos por año (1 anual, 4 trimestral)."""
     d["fcf"] = d["cfo"] - d["capex"]
+    d["net_debt"] = d[["debt", "debt_st"]].fillna(0).sum(axis=1) - d[["cash", "securities"]].fillna(0).sum(axis=1)
     for c in ["revenue", "gross_profit", "op_income", "net_income", "fcf"]:
         d[c + "_yoy"] = d[c].pct_change(k, fill_method=None)
         d["ttm_" + c] = d[c].rolling(k).sum() if k > 1 else d[c]
